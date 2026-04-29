@@ -1,0 +1,13 @@
+# Node
+node_modules/
+
+# Env / secrets
+.env
+.api_token
+
+# Logs / tmp
+server.log
+*.log
+*.tmp
+.tmp/
+.DS_Store
