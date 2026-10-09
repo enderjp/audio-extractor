@@ -11,3 +11,6 @@ server.log
 *.tmp
 .tmp/
 .DS_Store
+
+# Archivos generados por /compress
+files/

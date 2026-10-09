@@ -1,6 +1,6 @@
 # Audio Extract API
 
-Extrae audio MP3 desde un archivo de video vía HTTP. Implementada en Node.js (Express) con ffmpeg.
+Extrae audio MP3 y comprime videos desde un archivo de video vía HTTP. Implementada en Node.js (Express) con ffmpeg.
 
 Estado: Producción mínima viable (MVP)
 
@@ -11,6 +11,7 @@ Estado: Producción mínima viable (MVP)
 - Servidor: Express
 - Subida de archivos: multer (a /tmp)
 - Transcodificación: ffmpeg (fluent-ffmpeg + ffmpeg-static)
+- Entrega de videos comprimidos: estáticos en `/files` (nombre aleatorio + TTL)
 - Seguridad app: helmet + express-rate-limit
 - Exposición pública: Tailscale Serve + Funnel (TLS automático)
 - Servicio persistente: systemd
@@ -48,6 +49,106 @@ curl -s \
   -F "video=@/ruta/al/video.mp4" \
   https://<TU_HOST>.ts.net/extract -o salida.mp3
 ```
+
+
+### POST /compress
+- Descripción: recibe un video, lo comprime hasta quedar bajo un peso objetivo y devuelve la URL de descarga
+- Auth: requerida (Bearer token)
+- Content-Type: multipart/form-data
+- Campo de archivo: `video`
+- Tamaño máximo de entrada: 1 GB
+
+Parámetros opcionales (form-data o query string):
+
+| Parámetro | Default | Rango | Descripción |
+|---|---|---|---|
+| `max_mb` | `74` | 1–2048 | Peso máximo del resultado |
+| `max_width` | `1280` | 160–3840 | Ancho máximo (nunca escala hacia arriba) |
+| `max_height` | `720` | 120–2160 | Alto máximo (nunca escala hacia arriba) |
+| `fps` | `15` | 1–60 | Tope de cuadros por segundo |
+| `crf` | `28` | 0–51 | Calidad del primer intento (mayor = más compresión) |
+| `audio_kbps` | `96` | 16–320 | Bitrate del audio AAC |
+| `preset` | `fast` | `ultrafast`…`slow` | Preset de x264 (velocidad vs. tamaño) |
+| `delete_after_download` | `DELETE_AFTER_DOWNLOAD` (`false`) | `true`/`false` | Borra el archivo en cuanto se descarga completo |
+
+Respuesta 200:
+```json
+{
+  "video_url": "https://<TU_HOST>.ts.net/files/6c27512cd6d0b5601f8f0b05182a8f13.mp4",
+  "size_mb": 28.4,
+  "filename": "6c27512cd6d0b5601f8f0b05182a8f13.mp4",
+  "original_filename": "reunion.mp4",
+  "original_size_mb": 130.59,
+  "duration_sec": 90,
+  "expires_at": "2026-10-09T23:40:51.063Z",
+  "delete_after_download": false,
+  "attempts": [
+    { "mode": "crf 28", "size_mb": 33.54 },
+    { "mode": "169 kbps", "size_mb": 28.4 }
+  ]
+}
+```
+
+Cómo garantiza el peso:
+1. Primer intento con calidad constante (`-crf`, equivalente al comando de referencia):
+   `scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=15`
+   + `libx264 -preset fast -crf 28`, `aac 96k`, `-movflags +faststart`.
+2. Si el resultado todavía supera `max_mb`, recalcula el bitrate de video a partir de la
+   duración y el presupuesto (`max_mb * 0.95`) y reencoda, corrigiendo con el tamaño medido.
+   Hasta 3 reintentos; `attempts` muestra el recorrido.
+3. Si ni con < 48 kbps de video cabe (video demasiado largo), responde 500 con el detalle.
+
+Ejemplo curl:
+```bash
+curl -s \
+  -H "Authorization: Bearer <TOKEN>" \
+  -F "video=@/ruta/al/video.mp4" \
+  "https://<TU_HOST>.ts.net/compress?max_mb=74"
+```
+
+Uso en n8n:
+1. Nodo **HTTP Request** → `POST https://<TU_HOST>.ts.net/compress`,
+   Authentication: Header `Authorization: Bearer <TOKEN>`,
+   Body: Form-Data, campo `video` de tipo *n8n Binary File* (propiedad `data`).
+2. El JSON de salida trae `video_url` y `size_mb` listos para usar.
+3. Para no acumular archivos, elegí una de estas tres (ninguna requiere cron):
+   - `delete_after_download=true` en el request: el archivo se borra solo cuando n8n
+     termina de descargarlo (lo más simple si solo lo consume un nodo).
+   - `DELETE /files/{filename}` con el token, al final del flujo.
+   - No hacer nada: expira igual a los `FILE_TTL_MINUTES`.
+
+### GET /files/:name
+- Descripción: descarga del video comprimido (`video/mp4`)
+- Auth: no requiere — el nombre es aleatorio de 128 bits, la URL *es* la credencial
+- Vigencia: `FILE_TTL_MINUTES` (180 min por defecto); luego se borra automáticamente
+
+### DELETE /files/:name
+- Descripción: borra un video comprimido antes de que expire
+- Auth: requerida (Bearer token)
+- Respuesta 200: `{ "ok": true, "deleted": "<filename>" }`
+
+---
+
+## Ciclo de vida de los archivos comprimidos
+
+Ningún video se guarda de forma permanente. Hay tres mecanismos, y siempre
+aplica al menos el TTL:
+
+| Mecanismo | Cuándo borra | Cómo se activa |
+|---|---|---|
+| Borrado tras descarga | Al completarse la descarga | `delete_after_download=true` en el request, o `DELETE_AFTER_DOWNLOAD=true` global |
+| Borrado explícito | Cuando el cliente lo pide | `DELETE /files/{filename}` |
+| TTL (red de seguridad) | A los `FILE_TTL_MINUTES` | Siempre activo; barrido cada 10 min y también al arrancar |
+
+Sobre el borrado tras descarga:
+- El archivo lleva el sufijo `.once` en el nombre, así que el comportamiento sobrevive
+  a un reinicio del servicio (no depende de estado en memoria).
+- Solo se borra si el cuerpo se envió **completo**. Una descarga cortada a mitad deja el
+  archivo intacto y se puede reintentar.
+- Al ser de un solo uso, se sirve sin soporte de `Range` y no se puede descargar dos
+  veces: si tu flujo necesita reintentos o varios consumidores, usá `DELETE` o el TTL.
+- El video de entrada subido siempre se borra de `/tmp` al terminar el request, haya
+  éxito o error.
 
 ---
 
@@ -123,6 +224,13 @@ El servidor intenta limpiar archivos temporales luego de enviar la respuesta.
 
 ## Configuración y límites
 - Límite de archivo: `multer.limits.fileSize` en `server.js` (por defecto 1 GB)
+- Variables de `/compress` (ver `.env.example`):
+  - `FILES_DIR`: carpeta de salida servida en `/files` (default `./files`)
+  - `FILE_TTL_MINUTES`: vigencia de cada archivo (default 180). Hay un barrido cada 10 min
+  - `DELETE_AFTER_DOWNLOAD`: default de `delete_after_download` (default `false`)
+  - `PUBLIC_BASE_URL`: base de `video_url`. Si falta, se deduce de `Host` / `X-Forwarded-*`
+- El servidor no impone timeout de request: comprimir un video largo puede tardar minutos
+  (ajustar también el timeout del nodo HTTP Request en n8n)
 - Parámetros de audio: `.audioBitrate('192k')`, `.audioFrequency(44100)`, formato `mp3`
 - Rate limit: 200 requests / 15 min por IP (ajustable)
 - `helmet` aplicado para headers de seguridad
@@ -140,6 +248,7 @@ curl -s http://127.0.0.1:3080/health
 ---
 
 ## Roadmap / mejoras posibles
+- Procesamiento asíncrono con job id + polling para videos muy largos
 - Permitir elegir formato de salida (AAC, WAV, etc.)
 - Ajuste dinámico de bitrate/calidad vía query params
 - Soporte para archivos >1 GB con límites controlados y chunked uploads
