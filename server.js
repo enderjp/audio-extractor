@@ -152,11 +152,17 @@ function publicUrlFor(req, name) {
   return `${publicBaseUrl || `${proto}://${host}`}/files/${name}`;
 }
 
-// Configure multer for disk storage in OS temp dir
+// Configure multer for disk storage in OS temp dir. The stored name is random:
+// an uploaded name can carry control characters (n8n sends the filename in a
+// header and multer decodes it as latin1, so a multi-byte char turns into C1
+// control bytes) and ffmpeg then fails to open the path with EINVAL.
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, os.tmpdir()),
-    filename: (req, file, cb) => cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}-${path.basename(file.originalname)}`)
+    filename: (req, file, cb) => {
+      const ext = (path.extname(file.originalname || '').match(/^\.[A-Za-z0-9]{1,10}$/) || [''])[0];
+      cb(null, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`);
+    }
   }),
   limits: {
     fileSize: 1024 * 1024 * 1024 // 1 GB max
@@ -170,8 +176,10 @@ app.post('/extract', requireAuth, upload.single('video'), async (req, res) => {
   }
 
   const inputPath = req.file.path;
-  const baseName = path.parse(req.file.originalname).name || 'audio';
-  const outPath = path.join(os.tmpdir(), `${baseName}-${Date.now()}.mp3`);
+  // The download name is only a header; the path on disk stays random
+  const downloadName = sanitizeDownloadName(path.parse(req.file.originalname || '').name, '.mp3')
+    || 'audio.mp3';
+  const outPath = path.join(os.tmpdir(), generatedName('mp3', false));
 
   try {
     // Transcode to MP3 with sensible defaults (128k bitrate, 44100 Hz)
@@ -190,7 +198,7 @@ app.post('/extract', requireAuth, upload.single('video'), async (req, res) => {
     const stat = await fs.stat(outPath);
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Content-Length', stat.size);
-    res.setHeader('Content-Disposition', `attachment; filename="${baseName}.mp3"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
 
     // Stream the file then cleanup
     const stream = createReadStream(outPath);
@@ -201,7 +209,10 @@ app.post('/extract', requireAuth, upload.single('video'), async (req, res) => {
     });
     stream.pipe(res);
   } catch (err) {
+    // JSON-escaped so control characters in the uploaded name stay visible
     console.error('ffmpeg error:', err?.message || err);
+    console.error('  original name:', JSON.stringify(req.file.originalname));
+    console.error('  in:', inputPath, '-> out:', outPath);
     try { await fs.unlink(outPath); } catch {}
     try { await fs.unlink(inputPath); } catch {}
     res.status(500).json({ error: 'Failed to extract audio', detail: String(err?.message || err) });
@@ -537,7 +548,7 @@ app.use((err, req, res, next) => {
 });
 
 const server = app.listen(port, '0.0.0.0', () => {
-  console.log(`audio-extract-api listening on 0.0.0.0:${port} (files: ${filesDir})`);
+  console.log(`audio-extract-api listening on 0.0.0.0:${port} (files: ${filesDir}, tmp: ${os.tmpdir()})`);
 });
 
 // Compressing a long video can take several minutes; don't let the socket die
