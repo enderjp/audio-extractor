@@ -1,6 +1,6 @@
 # Audio Extract API
 
-Extrae audio MP3 y comprime videos desde un archivo de video vía HTTP. Implementada en Node.js (Express) con ffmpeg.
+Extrae audio MP3, comprime videos y genera PDFs de transcripciones vía HTTP. Implementada en Node.js (Express) con ffmpeg.
 
 Estado: Producción mínima viable (MVP)
 
@@ -11,10 +11,11 @@ Estado: Producción mínima viable (MVP)
 - Servidor: Express
 - Subida de archivos: multer (a /tmp)
 - Transcodificación: ffmpeg (fluent-ffmpeg + ffmpeg-static)
-- Entrega de videos comprimidos: estáticos en `/files` (nombre aleatorio + TTL)
+- Generación de PDF: pdfkit
+- Entrega de archivos generados: estáticos en `/files` (nombre aleatorio + TTL)
 - Seguridad app: helmet + express-rate-limit
 - Exposición pública: Tailscale Serve + Funnel (TLS automático)
-- Servicio persistente: systemd
+- Servicio persistente: Docker Compose en el droplet (antes: systemd)
 
 Ruta de proyecto: /root/.openclaw/workspace/audio-extract-api
 
@@ -117,21 +118,88 @@ Uso en n8n:
    - `DELETE /files/{filename}` con el token, al final del flujo.
    - No hacer nada: expira igual a los `FILE_TTL_MINUTES`.
 
+
+### POST /pdf
+- Descripción: recibe el texto de una transcripción y devuelve un PDF paginado
+- Auth: requerida (Bearer token)
+- Content-Type: `application/json`, `multipart/form-data`, `application/x-www-form-urlencoded` o `text/plain`
+- Campo de texto: `text` (o `transcript`). En `text/plain`, el body entero es el texto
+- Tamaño máximo del body: 20 MB (`TEXT_BODY_LIMIT`)
+
+Parámetros opcionales (body o query string):
+
+| Parámetro | Default | Descripción |
+|---|---|---|
+| `title` | — | Título en la primera página (y metadata del PDF) |
+| `subtitle` | — | Línea gris bajo el título: fecha, archivo origen, duración… |
+| `filename` | — | Nombre con el que se descarga el archivo |
+| `page_size` | `A4` | `A4`, `LETTER`, `LEGAL` o `A5` |
+| `font_size` | `11` | Tamaño de la fuente base (6–36) |
+| `line_gap` | `3` | Espacio extra entre líneas (0–20) |
+| `margin` | `56` | Margen en puntos (18–140; 56 pt ≈ 2 cm) |
+| `response` | `json` | `file` devuelve el PDF directo en vez de una URL |
+| `delete_after_download` | `DELETE_AFTER_DOWNLOAD` | Igual que en `/compress` |
+
+Respuesta 200 (default, `response=json`):
+```json
+{
+  "pdf_url": "https://<TU_HOST>.ts.net/files/e65666a1….pdf?name=reunion.pdf",
+  "size_mb": 0.006,
+  "size_bytes": 6618,
+  "pages": 5,
+  "characters": 13016,
+  "filename": "e65666a1….pdf",
+  "expires_at": "2026-10-12T17:35:03.861Z",
+  "delete_after_download": false
+}
+```
+
+Con `response=file` responde `application/pdf` como adjunto y no deja nada en `/files`.
+
+Formato del documento:
+- Título en negrita, subtítulo gris y una línea divisoria, si se envían.
+- Las líneas en blanco del texto se vuelven separación de párrafo; cada otra línea
+  mantiene su salto propio y se ajusta sola al ancho (ideal para transcripciones con
+  marcas de tiempo o nombres de hablante, una por línea).
+- Pie de página con `página / total` en cada hoja.
+- Fuente Helvetica incrustada por el visor: cubre acentos, `ñ` y `¿¡` sin fuentes extra.
+  Alfabetos no latinos (cirílico, árabe, CJK) requerirían embeber una fuente TTF.
+
+Ejemplo curl:
+```bash
+curl -s \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"[00:01] Hablante 1: Hola...","title":"Transcripción de reunión","filename":"reunion.pdf"}' \
+  https://<TU_HOST>.ts.net/pdf
+```
+
+Uso en n8n (encadenado tras la transcripción):
+1. Nodo **HTTP Request** → `POST https://<TU_HOST>.ts.net/pdf`,
+   Body Content Type: **JSON**, con `text` tomado del nodo de transcripción
+   (p. ej. `{{ $json.text }}`) y, si querés, `title` y `filename`.
+2. Si el PDF lo vas a adjuntar a un email o subir a Drive, es más directo mandar
+   `response=file`: el nodo recibe el binario y lo pasás al siguiente nodo.
+3. Si preferís guardar el link, usá el default y leé `pdf_url`.
+
+---
+
 ### GET /files/:name
-- Descripción: descarga del video comprimido (`video/mp4`)
+- Descripción: descarga de un archivo generado — video comprimido (`video/mp4`) o PDF (`application/pdf`)
 - Auth: no requiere — el nombre es aleatorio de 128 bits, la URL *es* la credencial
+- Query opcional `?name=mi-archivo.pdf`: solo cambia el nombre con el que se guarda
 - Vigencia: `FILE_TTL_MINUTES` (180 min por defecto); luego se borra automáticamente
 
 ### DELETE /files/:name
-- Descripción: borra un video comprimido antes de que expire
+- Descripción: borra un archivo generado antes de que expire
 - Auth: requerida (Bearer token)
 - Respuesta 200: `{ "ok": true, "deleted": "<filename>" }`
 
 ---
 
-## Ciclo de vida de los archivos comprimidos
+## Ciclo de vida de los archivos generados
 
-Ningún video se guarda de forma permanente. Hay tres mecanismos, y siempre
+Ningún archivo se guarda de forma permanente. Hay tres mecanismos, y siempre
 aplica al menos el TTL:
 
 | Mecanismo | Cuándo borra | Cómo se activa |
@@ -148,7 +216,8 @@ Sobre el borrado tras descarga:
 - Al ser de un solo uso, se sirve sin soporte de `Range` y no se puede descargar dos
   veces: si tu flujo necesita reintentos o varios consumidores, usá `DELETE` o el TTL.
 - El video de entrada subido siempre se borra de `/tmp` al terminar el request, haya
-  éxito o error.
+  éxito o error. Con `/pdf?response=file` nada llega a publicarse: el PDF se arma en
+  `/tmp` y se borra al terminar de enviarse.
 
 ---
 
@@ -190,7 +259,84 @@ Nota: Funnel requiere estar habilitado en el panel de Tailscale (ya hecho).
 
 ---
 
-## Servicio (systemd)
+
+## Despliegue en producción con Docker (droplet)
+
+El contenedor escucha solo en `127.0.0.1:3080`, igual que el servicio systemd anterior,
+así que la configuración de Tailscale Serve/Funnel sigue sirviendo sin tocar nada.
+
+### Primera vez
+
+```bash
+# 1) Docker, si el droplet no lo tiene
+curl -fsSL https://get.docker.com | sh
+
+# 2) Código
+git clone https://github.com/enderjp/audio-extractor.git
+cd audio-extractor
+
+# 3) Configuración: .env NO está en el repo, hay que crearlo
+cp .env.example .env
+nano .env   # poner API_TOKEN y PUBLIC_BASE_URL reales
+
+# 4) Liberar el puerto 3080 si todavía corre la versión con systemd
+systemctl disable --now audio-extract-api
+
+# 5) Construir y levantar
+docker compose up -d --build
+
+# 6) Verificar
+docker compose ps
+curl -s http://127.0.0.1:3080/health
+docker compose logs -f api
+```
+
+`.env` mínimo para producción:
+
+```ini
+API_TOKEN=<token real>
+PUBLIC_BASE_URL=https://audio-extract-vps.tail52e58c.ts.net
+FILE_TTL_MINUTES=180
+DELETE_AFTER_DOWNLOAD=false
+```
+
+No pongas `FILES_DIR`, `TMPDIR`, `PORT` ni `FFMPEG_PATH` en `.env`: el
+`docker-compose.yml` ya los fija para que apunten al volumen del contenedor.
+
+### Actualizar a una versión nueva
+
+```bash
+cd audio-extractor
+git pull
+docker compose up -d --build
+curl -s http://127.0.0.1:3080/health
+```
+
+### Operación
+
+```bash
+docker compose logs -f api          # logs en vivo
+docker compose restart api          # reiniciar
+docker compose down                 # detener
+docker compose exec api df -h /data # espacio del volumen
+docker system df                    # espacio que usa Docker en total
+docker image prune -f               # limpiar imágenes viejas tras varios builds
+```
+
+### Notas de la imagen
+- Base `node:22-alpine` con el `ffmpeg` del sistema (`apk add ffmpeg`), no
+  `ffmpeg-static`: el build salta los postinstall (`npm ci --ignore-scripts`) y la
+  imagen queda ~80 MB más chica. `FFMPEG_PATH`/`FFPROBE_PATH` apuntan a `/usr/bin`.
+- Corre como el usuario `node`, sin root.
+- Subidas y archivos generados van al volumen `api-data` en `/data`, no a las capas de
+  la imagen. Con subidas de hasta 1 GB, dejá holgura de disco en el droplet.
+- `tini` como entrypoint: recoge los procesos hijos de ffmpeg y propaga las señales.
+- `HEALTHCHECK` contra `/health`, visible en `docker compose ps`.
+- Logs rotados a 3 archivos de 10 MB.
+
+---
+
+## Servicio (systemd, método anterior)
 Unit: `/etc/systemd/system/audio-extract-api.service`
 
 Variables de entorno: `/etc/default/audio-extract-api`
@@ -224,10 +370,13 @@ El servidor intenta limpiar archivos temporales luego de enviar la respuesta.
 
 ## Configuración y límites
 - Límite de archivo: `multer.limits.fileSize` en `server.js` (por defecto 1 GB)
-- Variables de `/compress` (ver `.env.example`):
+- Variables de entorno (ver `.env.example`; en Docker, las de rutas las fija `docker-compose.yml`):
   - `FILES_DIR`: carpeta de salida servida en `/files` (default `./files`)
   - `FILE_TTL_MINUTES`: vigencia de cada archivo (default 180). Hay un barrido cada 10 min
   - `DELETE_AFTER_DOWNLOAD`: default de `delete_after_download` (default `false`)
+  - `TEXT_BODY_LIMIT`: tamaño máximo del body de texto en `/pdf` (default `20mb`)
+  - `FFMPEG_PATH` / `FFPROBE_PATH`: binarios a usar. Si no se definen, se usa el de
+    `ffmpeg-static` y, si tampoco está, el `ffmpeg` del `PATH` (el caso de Docker)
   - `PUBLIC_BASE_URL`: base de `video_url`. Si falta, se deduce de `Host` / `X-Forwarded-*`
 - El servidor no impone timeout de request: comprimir un video largo puede tardar minutos
   (ajustar también el timeout del nodo HTTP Request en n8n)
@@ -249,6 +398,7 @@ curl -s http://127.0.0.1:3080/health
 
 ## Roadmap / mejoras posibles
 - Procesamiento asíncrono con job id + polling para videos muy largos
+- Endpoint que encadene extraer audio → transcribir → PDF en un solo request
 - Permitir elegir formato de salida (AAC, WAV, etc.)
 - Ajuste dinámico de bitrate/calidad vía query params
 - Soporte para archivos >1 GB con límites controlados y chunked uploads

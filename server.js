@@ -1,29 +1,44 @@
 import express from 'express';
 import multer from 'multer';
 import fs from 'fs/promises';
-import { createReadStream } from 'fs';
+import { createReadStream, createWriteStream } from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import { existsSync } from 'fs';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
+import PDFDocument from 'pdfkit';
 
-// Configure ffmpeg binary
-if (ffmpegStatic) {
-  ffmpeg.setFfmpegPath(ffmpegStatic);
+// ffmpeg binary: an explicit FFMPEG_PATH wins, then the bundled static build,
+// then whatever `ffmpeg` is on PATH (how the Docker image provides it).
+const ffmpegPath = process.env.FFMPEG_PATH
+  || (ffmpegStatic && existsSync(ffmpegStatic) ? ffmpegStatic : null);
+if (ffmpegPath) {
+  if (!existsSync(ffmpegPath)) {
+    console.error(`FFMPEG_PATH does not exist: ${ffmpegPath}`);
+    process.exit(1);
+  }
+  ffmpeg.setFfmpegPath(ffmpegPath);
 }
+console.log(`ffmpeg: ${ffmpegPath || 'from PATH'}`);
 
 // ffprobe is optional: if unavailable we fall back to the duration that
 // ffmpeg reports on its first pass (codecData event).
 let ffprobeAvailable = false;
-try {
-  const { default: ffprobeStatic } = await import('ffprobe-static');
-  if (ffprobeStatic?.path) {
-    ffmpeg.setFfprobePath(ffprobeStatic.path);
-    ffprobeAvailable = true;
+if (process.env.FFPROBE_PATH) {
+  ffmpeg.setFfprobePath(process.env.FFPROBE_PATH);
+  ffprobeAvailable = true;
+} else {
+  try {
+    const { default: ffprobeStatic } = await import('ffprobe-static');
+    if (ffprobeStatic?.path) {
+      ffmpeg.setFfprobePath(ffprobeStatic.path);
+      ffprobeAvailable = true;
+    }
+  } catch {
+    console.warn('ffprobe not configured: duration will be read from ffmpeg output');
   }
-} catch {
-  console.warn('ffprobe-static not installed: duration will be read from ffmpeg output');
 }
 
 import helmet from 'helmet';
@@ -48,6 +63,12 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200 });
 app.use(limiter);
 
+// Transcripts arrive as JSON, form-urlencoded or raw text
+const bodyLimit = process.env.TEXT_BODY_LIMIT || '20mb';
+app.use(express.json({ limit: bodyLimit }));
+app.use(express.urlencoded({ extended: false, limit: bodyLimit }));
+app.use(express.text({ limit: bodyLimit, type: ['text/plain', 'text/markdown'] }));
+
 // Auth middleware (Bearer token)
 function requireAuth(req, res, next) {
   if (!apiToken) return res.status(503).json({ error: 'API not configured (missing API_TOKEN)' });
@@ -63,9 +84,9 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'audio-extract-api' });
 });
 
-// Compressed videos are named <32 hex>.mp4, or <32 hex>.once.mp4 when the
+// Generated files are named <32 hex>.<ext>, or <32 hex>.once.<ext> when the
 // caller asked for the file to be dropped right after it is downloaded.
-const FILE_NAME_RE = /^[a-f0-9]{32}(\.once)?\.mp4$/;
+const FILE_NAME_RE = /^[a-f0-9]{32}(\.once)?\.(mp4|pdf)$/;
 
 // Public download of compressed videos. Names are random (128 bits), so the
 // URL itself is the credential; files are deleted after FILE_TTL_MINUTES at
@@ -74,7 +95,11 @@ app.get('/files/:name', (req, res, next) => {
   const name = path.basename(req.params.name);
   if (!FILE_NAME_RE.test(name)) return res.status(400).json({ error: 'Invalid filename' });
 
-  const oneShot = name.endsWith('.once.mp4');
+  const oneShot = /\.once\.[a-z0-9]+$/.test(name);
+
+  // Optional ?name=... only changes the filename the browser/client saves as
+  const asName = sanitizeDownloadName(req.query?.name, path.extname(name));
+  if (asName) res.setHeader('Content-Disposition', `attachment; filename="${asName}"`);
   if (oneShot) {
     // A partial download must stay downloadable, so don't serve ranges
     res.setHeader('Accept-Ranges', 'none');
@@ -100,6 +125,32 @@ app.get('/files/:name', (req, res, next) => {
     }
   });
 });
+
+// Random, unguessable name for a generated file. The `.once` marker makes the
+// download handler delete it as soon as it has been fully served.
+function generatedName(ext, oneShot) {
+  return `${crypto.randomBytes(16).toString('hex')}${oneShot ? '.once' : ''}.${ext}`;
+}
+
+// Keeps a caller-supplied download name but strips anything path- or
+// header-unsafe, and forces the real extension.
+function sanitizeDownloadName(raw, ext) {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const base = path.basename(raw).replace(/[^\w .,()\-\u00c0-\u024f]/g, '_').slice(0, 120).trim();
+  if (!base || base === '.' || base === '..') return null;
+  return base.toLowerCase().endsWith(ext) ? base : `${base}${ext}`;
+}
+
+function isTruthy(value, fallback = false) {
+  if (value == null) return fallback;
+  return /^(1|true|yes)$/i.test(String(value));
+}
+
+function publicUrlFor(req, name) {
+  const proto = req.headers['x-forwarded-proto']?.split(',')[0] || req.protocol;
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  return `${publicBaseUrl || `${proto}://${host}`}/files/${name}`;
+}
 
 // Configure multer for disk storage in OS temp dir
 const upload = multer({
@@ -237,13 +288,10 @@ app.post('/compress', requireAuth, upload.single('video'), async (req, res) => {
   const preset = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow']
     .includes(String(opt('preset'))) ? String(opt('preset')) : 'fast';
 
-  const rawFlag = opt('delete_after_download');
-  const deleteAfterDownload = rawFlag == null
-    ? deleteAfterDownloadDefault
-    : /^(1|true|yes)$/i.test(String(rawFlag));
+  const deleteAfterDownload = isTruthy(opt('delete_after_download'), deleteAfterDownloadDefault);
 
   const inputPath = req.file.path;
-  const outName = `${crypto.randomBytes(16).toString('hex')}${deleteAfterDownload ? '.once' : ''}.mp4`;
+  const outName = generatedName('mp4', deleteAfterDownload);
   const outPath = path.join(filesDir, outName);
   const filter = videoFilter({ maxWidth, maxHeight, fps });
   const targetBytes = maxMb * MB;
@@ -289,12 +337,8 @@ app.post('/compress', requireAuth, upload.single('video'), async (req, res) => {
       throw new Error(`Could not get under ${maxMb} MB (best: ${(size / MB).toFixed(2)} MB)`);
     }
 
-    const proto = req.headers['x-forwarded-proto']?.split(',')[0] || req.protocol;
-    const host = req.headers['x-forwarded-host'] || req.headers.host;
-    const baseUrl = publicBaseUrl || `${proto}://${host}`;
-
     res.json({
-      video_url: `${baseUrl}/files/${outName}`,
+      video_url: publicUrlFor(req, outName),
       size_mb: Number((size / MB).toFixed(2)),
       filename: outName,
       original_filename: req.file.originalname,
@@ -310,6 +354,142 @@ app.post('/compress', requireAuth, upload.single('video'), async (req, res) => {
     res.status(500).json({ error: 'Failed to compress video', detail: String(err?.message || err) });
   } finally {
     try { await fs.unlink(inputPath); } catch {}
+  }
+});
+
+// --- Transcript to PDF -------------------------------------------------
+
+const PAGE_SIZES = ['A4', 'LETTER', 'LEGAL', 'A5'];
+
+// Renders the transcript into a paginated PDF. Blank lines become paragraph
+// breaks; every other line keeps its own break and wraps on its own.
+function buildPdf(outPath, { text, title, subtitle, pageSize, fontSize, lineGap, margin }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({
+      size: pageSize,
+      margins: { top: margin, bottom: margin, left: margin, right: margin },
+      bufferPages: true,
+      info: { Title: title || 'Transcripción', Creator: 'audio-extract-api' }
+    });
+
+    const stream = createWriteStream(outPath);
+    stream.on('error', reject);
+    doc.on('error', reject);
+
+    if (title) {
+      doc.font('Helvetica-Bold').fontSize(Math.round(fontSize * 1.7)).fillColor('#111');
+      doc.text(title, { align: 'left' });
+      doc.moveDown(0.25);
+    }
+    if (subtitle) {
+      doc.font('Helvetica').fontSize(Math.round(fontSize * 0.85)).fillColor('#666');
+      doc.text(subtitle, { align: 'left' });
+      doc.moveDown(0.25);
+    }
+    if (title || subtitle) {
+      const y = doc.y + 2;
+      doc.moveTo(margin, y).lineTo(doc.page.width - margin, y).strokeColor('#dddddd').lineWidth(1).stroke();
+      doc.moveDown(0.9);
+    }
+
+    doc.font('Helvetica').fontSize(fontSize).fillColor('#000');
+    const lines = text.replace(/\r\n?/g, '\n').split('\n');
+    let pendingBreak = false;
+    for (const line of lines) {
+      if (!line.trim()) {
+        pendingBreak = true;
+        continue;
+      }
+      if (pendingBreak) {
+        doc.moveDown(0.6);
+        pendingBreak = false;
+      }
+      doc.text(line, { align: 'left', lineGap });
+    }
+
+    // Page numbers, written below the bottom margin on each buffered page
+    const range = doc.bufferedPageRange();
+    for (let i = range.start; i < range.start + range.count; i += 1) {
+      doc.switchToPage(i);
+      doc.page.margins.bottom = 0; // keep the footer from spawning a new page
+      doc.font('Helvetica').fontSize(Math.round(fontSize * 0.8)).fillColor('#888');
+      doc.text(
+        `${i + 1} / ${range.count}`,
+        margin,
+        doc.page.height - margin * 0.6,
+        { width: doc.page.width - margin * 2, align: 'center', lineBreak: false }
+      );
+    }
+
+    stream.on('finish', () => resolve({ pages: range.count }));
+    doc.pipe(stream);
+    doc.end();
+  });
+}
+
+// POST /pdf turns a transcript into a PDF.
+// Body: JSON { text, title?, subtitle?, filename?, ... }, form-urlencoded,
+// form-data or raw text/plain. Same options also accepted as query params.
+// Returns JSON with pdf_url by default, or the PDF itself with response=file.
+app.post('/pdf', requireAuth, upload.none(), async (req, res) => {
+  const body = typeof req.body === 'string' ? { text: req.body } : (req.body || {});
+  const opt = (name) => body?.[name] ?? req.query?.[name];
+
+  const raw = opt('text') ?? opt('transcript');
+  const text = typeof raw === 'string' ? raw : '';
+  if (!text.trim()) {
+    return res.status(400).json({
+      error: 'No text provided. Send JSON { "text": "..." }, a form field "text", or a text/plain body.'
+    });
+  }
+
+  const title = typeof opt('title') === 'string' ? opt('title').slice(0, 300) : '';
+  const subtitle = typeof opt('subtitle') === 'string' ? opt('subtitle').slice(0, 300) : '';
+  const pageSizeRaw = String(opt('page_size') || 'A4').toUpperCase();
+  const pageSize = PAGE_SIZES.includes(pageSizeRaw) ? pageSizeRaw : 'A4';
+  const fontSize = Math.round(clamp(opt('font_size'), 6, 36, 11));
+  const lineGap = Math.round(clamp(opt('line_gap'), 0, 20, 3));
+  const margin = Math.round(clamp(opt('margin'), 18, 140, 56));
+  const asFile = String(opt('response') || '').toLowerCase() === 'file';
+  const deleteAfterDownload = isTruthy(opt('delete_after_download'), deleteAfterDownloadDefault);
+  const downloadName = sanitizeDownloadName(opt('filename'), '.pdf');
+
+  // In file mode nothing is published, so it goes straight to the temp dir
+  const outName = generatedName('pdf', deleteAfterDownload);
+  const outPath = asFile
+    ? path.join(os.tmpdir(), outName)
+    : path.join(filesDir, outName);
+
+  try {
+    const { pages } = await buildPdf(outPath, {
+      text, title, subtitle, pageSize, fontSize, lineGap, margin
+    });
+    const { size } = await fs.stat(outPath);
+
+    if (asFile) {
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Length', size);
+      res.setHeader('Content-Disposition', `attachment; filename="${downloadName || 'transcript.pdf'}"`);
+      const stream = createReadStream(outPath);
+      stream.on('close', async () => { try { await fs.unlink(outPath); } catch {} });
+      return stream.pipe(res);
+    }
+
+    const url = publicUrlFor(req, outName);
+    res.json({
+      pdf_url: downloadName ? `${url}?name=${encodeURIComponent(downloadName)}` : url,
+      size_mb: Number((size / MB).toFixed(3)),
+      size_bytes: size,
+      pages,
+      characters: text.length,
+      filename: outName,
+      expires_at: new Date(Date.now() + fileTtlMinutes * 60 * 1000).toISOString(),
+      delete_after_download: deleteAfterDownload
+    });
+  } catch (err) {
+    console.error('pdf error:', err?.message || err);
+    try { await fs.unlink(outPath); } catch {}
+    res.status(500).json({ error: 'Failed to build PDF', detail: String(err?.message || err) });
   }
 });
 
