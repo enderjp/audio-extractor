@@ -15,7 +15,7 @@ Estado: Producción mínima viable (MVP)
 - Entrega de archivos generados: estáticos en `/files` (nombre aleatorio + TTL)
 - Seguridad app: helmet + express-rate-limit
 - Exposición pública: Tailscale Serve + Funnel (TLS automático)
-- Servicio persistente: Docker Compose en el droplet (antes: systemd)
+- Servicio persistente: Docker Compose en el droplet (config no versionada; antes: systemd)
 
 Ruta de proyecto: /root/.openclaw/workspace/audio-extract-api
 
@@ -262,77 +262,71 @@ Nota: Funnel requiere estar habilitado en el panel de Tailscale (ya hecho).
 
 ## Despliegue en producción con Docker (droplet)
 
-El contenedor escucha solo en `127.0.0.1:3080`, igual que el servicio systemd anterior,
-así que la configuración de Tailscale Serve/Funnel sigue sirviendo sin tocar nada.
+Ruta en el droplet: `/srv/api-audio-extractor/audio-extractor`
 
-### Primera vez
+El `Dockerfile`, el `docker-compose.yml` y el `.dockerignore` **no están versionados**
+(ver `.gitignore`): viven solo en el servidor, porque están ajustados a ese entorno.
+El repo trae únicamente el código y el `package.json`. Si hay que recrearlos, hay una
+versión de referencia en el commit `438af7a`:
 
 ```bash
-# 1) Docker, si el droplet no lo tiene
-curl -fsSL https://get.docker.com | sh
-
-# 2) Código
-git clone https://github.com/enderjp/audio-extractor.git
-cd audio-extractor
-
-# 3) Configuración: .env NO está en el repo, hay que crearlo
-cp .env.example .env
-nano .env   # poner API_TOKEN y PUBLIC_BASE_URL reales
-
-# 4) Liberar el puerto 3080 si todavía corre la versión con systemd
-systemctl disable --now audio-extract-api
-
-# 5) Construir y levantar
-docker compose up -d --build
-
-# 6) Verificar
-docker compose ps
-curl -s http://127.0.0.1:3080/health
-docker compose logs -f api
+git show 438af7a:Dockerfile
+git show 438af7a:docker-compose.yml
 ```
 
-`.env` mínimo para producción:
-
-```ini
-API_TOKEN=<token real>
-PUBLIC_BASE_URL=https://audio-extract-vps.tail52e58c.ts.net
-FILE_TTL_MINUTES=180
-DELETE_AFTER_DOWNLOAD=false
-```
-
-No pongas `FILES_DIR`, `TMPDIR`, `PORT` ni `FFMPEG_PATH` en `.env`: el
-`docker-compose.yml` ya los fija para que apunten al volumen del contenedor.
+El contenedor escucha en `127.0.0.1:3080`, así que la configuración de
+Tailscale Serve/Funnel sirve sin cambios.
 
 ### Actualizar a una versión nueva
 
 ```bash
-cd audio-extractor
+cd /srv/api-audio-extractor/audio-extractor
 git pull
-docker compose up -d --build
+docker compose up -d --build   # --build es necesario si cambiaron las dependencias
 curl -s http://127.0.0.1:3080/health
 ```
 
 ### Operación
 
 ```bash
-docker compose logs -f api          # logs en vivo
-docker compose restart api          # reiniciar
+docker compose ps                   # estado y healthcheck
+docker compose logs -f              # logs en vivo
+docker compose restart              # reiniciar
 docker compose down                 # detener
-docker compose exec api df -h /data # espacio del volumen
-docker system df                    # espacio que usa Docker en total
+docker system df                    # espacio que usa Docker
 docker image prune -f               # limpiar imágenes viejas tras varios builds
 ```
 
-### Notas de la imagen
-- Base `node:22-alpine` con el `ffmpeg` del sistema (`apk add ffmpeg`), no
-  `ffmpeg-static`: el build salta los postinstall (`npm ci --ignore-scripts`) y la
-  imagen queda ~80 MB más chica. `FFMPEG_PATH`/`FFPROBE_PATH` apuntan a `/usr/bin`.
-- Corre como el usuario `node`, sin root.
-- Subidas y archivos generados van al volumen `api-data` en `/data`, no a las capas de
-  la imagen. Con subidas de hasta 1 GB, dejá holgura de disco en el droplet.
-- `tini` como entrypoint: recoge los procesos hijos de ffmpeg y propaga las señales.
-- `HEALTHCHECK` contra `/health`, visible en `docker compose ps`.
-- Logs rotados a 3 archivos de 10 MB.
+### Lo que el contenedor necesita
+
+Requisitos del código, independientes de cómo esté armada la imagen:
+
+- **`ffmpeg` disponible.** Se resuelve en cascada: `FFMPEG_PATH` si está definida, si no
+  el binario de `ffmpeg-static`, y si tampoco existe, el `ffmpeg` del `PATH`. Con el
+  `ffmpeg` del sistema instalado (`apk add ffmpeg` / `apt-get install ffmpeg`) no hace
+  falta configurar nada. Si la imagen hace `npm ci --ignore-scripts`, el binario de
+  `ffmpeg-static` no se descarga y se usa el del sistema: ~80 MB menos de imagen.
+- **`ffprobe` (opcional).** Si está, se usa para leer la duración; si no, se deduce de la
+  salida de ffmpeg. `FFPROBE_PATH` para apuntarlo explícitamente.
+- **`.env` con `API_TOKEN` y `PUBLIC_BASE_URL`.** `.env` no está en el repo:
+
+  ```ini
+  API_TOKEN=<token real>
+  PUBLIC_BASE_URL=https://audio-extract-vps.tail52e58c.ts.net
+  FILE_TTL_MINUTES=180
+  DELETE_AFTER_DOWNLOAD=false
+  ```
+
+  Sin `PUBLIC_BASE_URL`, `video_url` y `pdf_url` se deducen de los headers.
+- **`FILES_DIR` con espacio en disco**, idealmente en un volumen. Si no se define, los
+  archivos van a `./files` dentro del contenedor: funciona, pero se pierden al recrearlo
+  y engordan la capa de escritura. Las subidas llegan a `os.tmpdir()` (`TMPDIR`), y con
+  un límite de 1 GB por archivo conviene dejar holgura.
+- **Un init que recoja procesos hijos** (`tini`, o `init: true` en compose): cada request
+  lanza uno o varios ffmpeg, y sin eso quedan zombies.
+
+Si estas variables se definen tanto en `.env` como en el `environment` del compose, ojo
+con la precedencia: `env_file` pisa el `ENV` de la imagen, y `environment` pisa a ambos.
 
 ---
 
