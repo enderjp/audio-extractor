@@ -447,9 +447,47 @@ curl -s http://127.0.0.1:3080/health
 
 ---
 
+## Modo asíncrono con callback (evaluado, no implementado)
+
+Decidido el 2026-10-13: **no se implementa por ahora**. La cola sincrónica alcanza
+para las ráfagas actuales; se monitorea `rejected` y `aborted` en `/health` unos días
+antes de decidir. Queda documentado para retomarlo sin rediseñarlo.
+
+**Problema que resuelve.** Monday dispara un webhook por video, así que varios videos
+subidos juntos llegan como ejecuciones *separadas* de n8n, que no se pueden serializar
+con Split In Batches. Hoy convergen en la cola del API y esperan con la conexión HTTP
+abierta, lo que obliga a calibrar `MAX_QUEUED_JOBS` contra el timeout del nodo.
+
+**Diseño.** `/compress` (y `/extract`) aceptan un `callback_url` opcional:
+
+1. El request responde `202 { "job_id": "..." }` de inmediato, sin esperar el encode.
+2. El trabajo entra en la misma cola que hoy.
+3. Al terminar, el API hace `POST` al `callback_url` con el mismo JSON que devuelve el
+   modo sincrónico. **También en caso de error**, con `{ "error": ... }`: si no, la
+   ejecución de n8n queda dormida hasta agotar su `Limit Wait Time`.
+
+En n8n: el nodo HTTP manda `callback_url = {{ $execution.resumeUrl }}`, y a continuación
+un nodo **Wait → On Webhook Call** con **Limit Wait Time** encendido (~30 min) para que
+una ejecución no quede colgada si el servidor se reinicia a mitad del job.
+
+Con esto desaparecen el timeout del nodo, `MAX_QUEUED_JOBS` y el manejo del `429`: las
+ejecuciones quedan suspendidas sin consumir conexiones y se despiertan en orden.
+
+**Dos puntos que no son obvios al implementarlo:**
+
+- `watchForAbort` mata el ffmpeg cuando el cliente se desconecta. En modo callback el
+  cliente se desconecta a propósito apenas recibe el `202`, así que esa lógica debe
+  quedar desactivada para los jobs asíncronos o cancelaría todos los encodes al instante.
+- `callback_url` es una URL arbitraria a la que el servidor hace POST: conviene una
+  allowlist por env (el dominio de n8n) y no seguir redirecciones, o cualquiera con el
+  token puede usar el API para disparar requests a donde quiera.
+
+---
+
 ## Roadmap / mejoras posibles
-- Procesamiento asíncrono con job id + polling para videos muy largos
 - Endpoint que encadene extraer audio → transcribir → PDF en un solo request
+- Parámetros de audio en `/extract` (hoy fijo en MP3 192 kbps estéreo; 64 kbps mono
+  alcanza para transcribir y reduce mucho el tamaño y el CPU)
 - Permitir elegir formato de salida (AAC, WAV, etc.)
 - Ajuste dinámico de bitrate/calidad vía query params
 - Soporte para archivos >1 GB con límites controlados y chunked uploads
