@@ -55,6 +55,79 @@ const publicBaseUrl = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 // Default for /compress?delete_after_download: borrar en cuanto se descarga
 const deleteAfterDownloadDefault = /^(1|true|yes)$/i.test(process.env.DELETE_AFTER_DOWNLOAD || '');
 
+// ffmpeg saturates every core it is given, so running several encodes at once
+// on a small box makes all of them slow enough to time out. One job at a time
+// finishes each request as fast as the hardware allows; the rest wait.
+const maxConcurrentJobs = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS || 1));
+const maxQueuedJobs = Math.max(0, Number(process.env.MAX_QUEUED_JOBS || 4));
+const ffmpegThreads = Math.max(0, Number(process.env.FFMPEG_THREADS || 0)); // 0 = auto
+
+const jobs = { active: 0, waiting: [], completed: 0, rejected: 0, aborted: 0 };
+
+// A job holds the slot and the running ffmpeg, so an abandoned request can
+// give both back instead of burning CPU for a client that already gave up.
+function newJob() {
+  return { aborted: false, command: null, entry: null, hasSlot: false };
+}
+
+function acquireSlot(job) {
+  if (jobs.active < maxConcurrentJobs) {
+    jobs.active += 1;
+    job.hasSlot = true;
+    return Promise.resolve();
+  }
+  if (jobs.waiting.length >= maxQueuedJobs) {
+    const err = new Error(`Server busy: ${jobs.active} running, ${jobs.waiting.length} queued`);
+    err.code = 'QUEUE_FULL';
+    jobs.rejected += 1;
+    return Promise.reject(err);
+  }
+  return new Promise((resolve, reject) => {
+    job.entry = {
+      start: () => { job.hasSlot = true; resolve(); },
+      cancel: reject
+    };
+    jobs.waiting.push(job.entry);
+  });
+}
+
+function releaseSlot(job) {
+  if (!job.hasSlot) return;
+  job.hasSlot = false;
+  const next = jobs.waiting.shift();
+  if (next) next.start();   // slot handed straight over, active stays the same
+  else jobs.active -= 1;
+}
+
+// Called when the client hangs up: stop queueing or kill the running encode
+function abandonJob(job) {
+  job.aborted = true;
+  jobs.aborted += 1;
+  if (job.entry) {
+    const i = jobs.waiting.indexOf(job.entry);
+    if (i !== -1) {
+      jobs.waiting.splice(i, 1);
+      const err = new Error('Client disconnected while queued');
+      err.code = 'ABORTED';
+      job.entry.cancel(err);
+    }
+  }
+  if (job.command) {
+    try { job.command.kill('SIGKILL'); } catch {}
+  }
+}
+
+// Listen on the response, not the request: multer has already consumed the
+// request stream by the time the handler runs, so its 'close' is long gone.
+// res 'close' with writableFinished false means the client hung up early.
+function watchForAbort(req, res, job) {
+  res.on('close', () => {
+    if (res.writableFinished || job.aborted) return;
+    console.warn('client disconnected, dropping job');
+    abandonJob(job);
+  });
+}
+
 await fs.mkdir(filesDir, { recursive: true });
 
 app.set('trust proxy', 'loopback');
@@ -81,7 +154,19 @@ function requireAuth(req, res, next) {
 
 // Health check (no auth)
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'audio-extract-api' });
+  res.json({
+    ok: true,
+    service: 'audio-extract-api',
+    jobs: {
+      active: jobs.active,
+      waiting: jobs.waiting.length,
+      max_concurrent: maxConcurrentJobs,
+      max_queued: maxQueuedJobs,
+      completed: jobs.completed,
+      rejected: jobs.rejected,
+      aborted: jobs.aborted
+    }
+  });
 });
 
 // Generated files are named <32 hex>.<ext>, or <32 hex>.once.<ext> when the
@@ -181,19 +266,31 @@ app.post('/extract', requireAuth, upload.single('video'), async (req, res) => {
     || 'audio.mp3';
   const outPath = path.join(os.tmpdir(), generatedName('mp3', false));
 
+  const job = newJob();
+  watchForAbort(req, res, job);
+
+  try {
+    await acquireSlot(job);
+  } catch (err) {
+    try { await fs.unlink(inputPath); } catch {}
+    return respondToSlotError(res, err);
+  }
+
   try {
     // Transcode to MP3 with sensible defaults (128k bitrate, 44100 Hz)
     await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
+      job.command = ffmpeg(inputPath)
         .noVideo()
         .audioCodec('libmp3lame')
         .audioBitrate('192k')
         .audioFrequency(44100)
+        .outputOptions(ffmpegThreads ? ['-threads', String(ffmpegThreads)] : [])
         .format('mp3')
-        .on('error', reject)
+        .on('error', (err) => reject(job.aborted ? abortedError() : err))
         .on('end', resolve)
         .save(outPath);
     });
+    jobs.completed += 1;
 
     const stat = await fs.stat(outPath);
     res.setHeader('Content-Type', 'audio/mpeg');
@@ -209,15 +306,37 @@ app.post('/extract', requireAuth, upload.single('video'), async (req, res) => {
     });
     stream.pipe(res);
   } catch (err) {
+    try { await fs.unlink(outPath); } catch {}
+    try { await fs.unlink(inputPath); } catch {}
+    if (err?.code === 'ABORTED') return;
     // JSON-escaped so control characters in the uploaded name stay visible
     console.error('ffmpeg error:', err?.message || err);
     console.error('  original name:', JSON.stringify(req.file.originalname));
     console.error('  in:', inputPath, '-> out:', outPath);
-    try { await fs.unlink(outPath); } catch {}
-    try { await fs.unlink(inputPath); } catch {}
     res.status(500).json({ error: 'Failed to extract audio', detail: String(err?.message || err) });
+  } finally {
+    releaseSlot(job);
   }
 });
+
+function abortedError() {
+  const err = new Error('Client disconnected');
+  err.code = 'ABORTED';
+  return err;
+}
+
+function respondToSlotError(res, err) {
+  if (err?.code === 'QUEUE_FULL') {
+    res.setHeader('Retry-After', '60');
+    return res.status(429).json({
+      error: 'Server busy, try again later',
+      detail: err.message,
+      active: jobs.active,
+      waiting: jobs.waiting.length
+    });
+  }
+  return undefined; // client is gone: nothing to answer
+}
 
 // --- Video compression -------------------------------------------------
 
@@ -235,10 +354,12 @@ function videoFilter({ maxWidth, maxHeight, fps }) {
 }
 
 // Runs one ffmpeg encode. `rate` is either {crf} or {videoBitrateKbps}.
-function encode({ inputPath, outPath, filter, preset, audioBitrateKbps, rate }) {
+function encode({ inputPath, outPath, filter, preset, audioBitrateKbps, rate, job }) {
   return new Promise((resolve, reject) => {
+    if (job?.aborted) return reject(abortedError());
     let duration = null;
     const options = ['-vf', filter, '-preset', preset, '-movflags', '+faststart'];
+    if (ffmpegThreads) options.push('-threads', String(ffmpegThreads));
 
     if (rate.crf != null) {
       options.push('-crf', String(rate.crf));
@@ -251,7 +372,7 @@ function encode({ inputPath, outPath, filter, preset, audioBitrateKbps, rate }) 
       );
     }
 
-    ffmpeg(inputPath)
+    const command = ffmpeg(inputPath)
       .videoCodec('libx264')
       .audioCodec('aac')
       .audioBitrate(`${audioBitrateKbps}k`)
@@ -264,9 +385,11 @@ function encode({ inputPath, outPath, filter, preset, audioBitrateKbps, rate }) 
           duration = parts[0] * 3600 + parts[1] * 60 + parts[2];
         }
       })
-      .on('error', reject)
+      .on('error', (err) => reject(job?.aborted ? abortedError() : err))
       .on('end', () => resolve({ duration }))
       .save(outPath);
+
+    if (job) job.command = command;
   });
 }
 
@@ -311,11 +434,22 @@ app.post('/compress', requireAuth, upload.single('video'), async (req, res) => {
   const budgetBytes = Math.floor(targetBytes * 0.95);
 
   const attempts = [];
+
+  const job = newJob();
+  watchForAbort(req, res, job);
+
+  try {
+    await acquireSlot(job);
+  } catch (err) {
+    try { await fs.unlink(inputPath); } catch {}
+    return respondToSlotError(res, err);
+  }
+
   let duration = await probeDuration(inputPath);
 
   try {
     // Pass 1: constant quality. Good videos land well under target already.
-    const first = await encode({ inputPath, outPath, filter, preset, audioBitrateKbps, rate: { crf } });
+    const first = await encode({ inputPath, outPath, filter, preset, audioBitrateKbps, rate: { crf }, job });
     if (!duration) duration = first.duration;
     let size = (await fs.stat(outPath)).size;
     attempts.push({ mode: `crf ${crf}`, size_mb: Number((size / MB).toFixed(2)) });
@@ -338,7 +472,7 @@ app.post('/compress', requireAuth, upload.single('video'), async (req, res) => {
         throw new Error(`Video too long for ${maxMb} MB: needs < 48 kbps of video`);
       }
 
-      await encode({ inputPath, outPath, filter, preset, audioBitrateKbps, rate: { videoBitrateKbps: videoKbps } });
+      await encode({ inputPath, outPath, filter, preset, audioBitrateKbps, rate: { videoBitrateKbps: videoKbps }, job });
       size = (await fs.stat(outPath)).size;
       attempts.push({ mode: `${videoKbps} kbps`, size_mb: Number((size / MB).toFixed(2)) });
       round += 1;
@@ -348,6 +482,7 @@ app.post('/compress', requireAuth, upload.single('video'), async (req, res) => {
       throw new Error(`Could not get under ${maxMb} MB (best: ${(size / MB).toFixed(2)} MB)`);
     }
 
+    jobs.completed += 1;
     res.json({
       video_url: publicUrlFor(req, outName),
       size_mb: Number((size / MB).toFixed(2)),
@@ -360,10 +495,13 @@ app.post('/compress', requireAuth, upload.single('video'), async (req, res) => {
       attempts
     });
   } catch (err) {
-    console.error('compress error:', err?.message || err);
     try { await fs.unlink(outPath); } catch {}
-    res.status(500).json({ error: 'Failed to compress video', detail: String(err?.message || err) });
+    if (err?.code !== 'ABORTED') {
+      console.error('compress error:', err?.message || err);
+      res.status(500).json({ error: 'Failed to compress video', detail: String(err?.message || err) });
+    }
   } finally {
+    releaseSlot(job);
     try { await fs.unlink(inputPath); } catch {}
   }
 });

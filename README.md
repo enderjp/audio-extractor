@@ -24,12 +24,22 @@ Ruta de proyecto: /root/.openclaw/workspace/audio-extract-api
 ## Endpoints
 
 ### GET /health
-- Descripción: verificación de vida del servicio
+- Descripción: verificación de vida del servicio y estado de la cola de trabajos
 - Auth: no requiere
 - Respuesta 200
 ```json
-{ "ok": true, "service": "audio-extract-api" }
+{
+  "ok": true,
+  "service": "audio-extract-api",
+  "jobs": {
+    "active": 1, "waiting": 2,
+    "max_concurrent": 1, "max_queued": 4,
+    "completed": 37, "rejected": 2, "aborted": 1
+  }
+}
 ```
+Sirve para monitorear saturación: `waiting` creciendo o `rejected` subiendo significa que
+llegan más videos de los que el servidor puede procesar.
 
 ### POST /extract
 - Descripción: recibe un archivo de video y devuelve el audio en MP3
@@ -197,6 +207,51 @@ Uso en n8n (encadenado tras la transcripción):
 
 ---
 
+
+## Concurrencia y carga de CPU
+
+Un encode de ffmpeg usa todos los núcleos que encuentra. Sin límite, tres videos
+simultáneos en un droplet de 2 vCPU no son tres veces más lento: son tres procesos
+peleando por los mismos núcleos, los tres tardan el triple y los tres dan timeout.
+
+Por eso los endpoints que usan ffmpeg (`/compress` y `/extract`) pasan por una cola:
+
+| Variable | Default | Qué hace |
+|---|---|---|
+| `MAX_CONCURRENT_JOBS` | `1` | Encodes simultáneos. Regla práctica: 1 cada 2 vCPU |
+| `MAX_QUEUED_JOBS` | `4` | Cuántos esperan antes de responder `429` |
+| `FFMPEG_THREADS` | `0` | Núcleos por encode (`0` = todos) |
+
+Comportamiento:
+- Si hay un slot libre, el encode arranca al instante.
+- Si no, el request **espera** en la cola. Tarda más, pero termina.
+- Si la cola está llena, responde **`429`** con `Retry-After: 60` en vez de aceptar
+  trabajo que no puede hacer. Es preferible un 429 rápido a un timeout a los 15 min.
+
+### Cancelación al desconectarse el cliente
+
+Si el cliente corta la conexión (típicamente: timeout del nodo HTTP de n8n), el
+servidor **mata el ffmpeg** y libera el slot. Sin esto, un timeout dejaba el encode
+corriendo y el reintento de n8n sumaba un segundo proceso al primero: cada timeout
+empeoraba la carga que lo causó.
+
+En `/health`, `aborted` cuenta cuántas veces pasó. Si ese número sube, el timeout del
+nodo en n8n es más corto que lo que tarda un encode: conviene subirlo (ver más abajo)
+en vez de dejar que reintente.
+
+### Si aun así se satura
+
+- **Subí el timeout del nodo HTTP en n8n** a 900000 ms (15 min) y **desactivá el
+  reintento automático**: con la cola, esperar es el comportamiento correcto.
+- **Bajá el costo por video**: `preset=veryfast`, `fps=10`, o `max_height=480` cuando
+  la calidad no importe. El preset es lo que más mueve la aguja.
+- **Limitá el contenedor** para que ffmpeg no ahogue a los demás servicios del droplet.
+  En el compose: `cpus: 1.5` y `mem_limit: 2g`.
+- **Serializá en n8n**: si el flujo procesa varios videos, mandalos de a uno (Split in
+  Batches con tamaño 1) en vez de en paralelo.
+
+---
+
 ## Ciclo de vida de los archivos generados
 
 Ningún archivo se guarda de forma permanente. Hay tres mecanismos, y siempre
@@ -356,6 +411,7 @@ Logs: `journalctl -u audio-extract-api -f`
 - 400: No se envió archivo (`video`) o request inválido
 - 401: Falta o es inválido el Bearer token
 - 413: Archivo supera el límite (1 GB por defecto)
+- 429: Cola de encodes llena (`Retry-After: 60`); reintentar más tarde
 - 500: Error interno de ffmpeg o del servidor
 
 El servidor intenta limpiar archivos temporales luego de enviar la respuesta.
@@ -369,6 +425,7 @@ El servidor intenta limpiar archivos temporales luego de enviar la respuesta.
   - `FILE_TTL_MINUTES`: vigencia de cada archivo (default 180). Hay un barrido cada 10 min
   - `DELETE_AFTER_DOWNLOAD`: default de `delete_after_download` (default `false`)
   - `TEXT_BODY_LIMIT`: tamaño máximo del body de texto en `/pdf` (default `20mb`)
+  - `MAX_CONCURRENT_JOBS` / `MAX_QUEUED_JOBS` / `FFMPEG_THREADS`: ver *Concurrencia*
   - `FFMPEG_PATH` / `FFPROBE_PATH`: binarios a usar. Si no se definen, se usa el de
     `ffmpeg-static` y, si tampoco está, el `ffmpeg` del `PATH` (el caso de Docker)
   - `PUBLIC_BASE_URL`: base de `video_url`. Si falta, se deduce de `Host` / `X-Forwarded-*`
