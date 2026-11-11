@@ -9,6 +9,7 @@ import { existsSync } from 'fs';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 import PDFDocument from 'pdfkit';
+import { downloadVideo, inputError } from './video-input.js';
 
 // ffmpeg binary: an explicit FFMPEG_PATH wins, then the bundled static build,
 // then whatever `ffmpeg` is on PATH (how the Docker image provides it).
@@ -61,6 +62,12 @@ const deleteAfterDownloadDefault = /^(1|true|yes)$/i.test(process.env.DELETE_AFT
 const maxConcurrentJobs = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS || 1));
 const maxQueuedJobs = Math.max(0, Number(process.env.MAX_QUEUED_JOBS || 4));
 const ffmpegThreads = Math.max(0, Number(process.env.FFMPEG_THREADS || 0)); // 0 = auto
+const maxInputBytes = Number(process.env.MAX_INPUT_MB || 1024) * 1024 * 1024;
+const downloadTimeoutMs = Number(process.env.DOWNLOAD_TIMEOUT_MS || 300000);
+if (!Number.isSafeInteger(maxInputBytes) || maxInputBytes <= 0
+    || !Number.isSafeInteger(downloadTimeoutMs) || downloadTimeoutMs <= 0 || downloadTimeoutMs > 2147483647) {
+  throw new Error('MAX_INPUT_MB and DOWNLOAD_TIMEOUT_MS must be positive, valid limits');
+}
 
 const jobs = { active: 0, waiting: [], completed: 0, rejected: 0, aborted: 0 };
 
@@ -250,12 +257,59 @@ const upload = multer({
     }
   }),
   limits: {
-    fileSize: 1024 * 1024 * 1024 // 1 GB max
+    fileSize: maxInputBytes
   }
 });
 
-// POST /extract expects form-data with field "video"
-app.post('/extract', requireAuth, upload.single('video'), async (req, res) => {
+// Download signed URLs immediately, before waiting for an encode slot. Bound
+// admitted URL requests (including queued encodes) to keep disk use predictable.
+let urlRequests = 0;
+async function prepareVideo(req, res, next) {
+  if (req.file) {
+    if (req.body?.url != null) {
+      await fs.unlink(req.file.path).catch(() => {});
+      return next(inputError(400, 'AMBIGUOUS_INPUT', 'Provide either a video file or a URL, not both.'));
+    }
+    return next();
+  }
+  if (!req.is('application/json') || typeof req.body?.url !== 'string' || !req.body.url.trim()) {
+    return next(inputError(400, 'MISSING_VIDEO', 'Use form-data field "video" or application/json with a non-empty "url".'));
+  }
+  if (urlRequests >= maxConcurrentJobs + maxQueuedJobs) {
+    jobs.rejected += 1;
+    return respondToSlotError(res, { code: 'QUEUE_FULL', message: 'URL request capacity reached' });
+  }
+  urlRequests += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    urlRequests -= 1;
+  };
+  res.once('finish', release);
+  const controller = new AbortController();
+  const onClose = () => {
+    if (!res.writableFinished) controller.abort();
+    release();
+  };
+  res.once('close', onClose);
+  try {
+    req.file = await downloadVideo(req.body.url, {
+      maxBytes: maxInputBytes, timeoutMs: downloadTimeoutMs, signal: controller.signal
+    });
+    if (res.destroyed) {
+      await fs.unlink(req.file.path).catch(() => {});
+      return;
+    }
+    next();
+  } catch (err) {
+    release();
+    if (!res.destroyed) next(err);
+  }
+}
+
+// POST /extract accepts a multipart video or a JSON URL.
+app.post('/extract', requireAuth, upload.single('video'), prepareVideo, async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded. Use form-data field "video".' });
   }
@@ -299,6 +353,8 @@ app.post('/extract', requireAuth, upload.single('video'), async (req, res) => {
 
     // Stream the file then cleanup
     const stream = createReadStream(outPath);
+    res.once('close', () => stream.destroy());
+    stream.on('error', () => res.destroy());
     stream.on('close', async () => {
       // Best-effort cleanup
       try { await fs.unlink(outPath); } catch {}
@@ -406,7 +462,7 @@ function probeDuration(inputPath) {
 // POST /compress expects form-data with field "video".
 // Optional fields (form-data or query): max_mb, max_width, max_height, fps,
 // crf, audio_kbps, preset.
-app.post('/compress', requireAuth, upload.single('video'), async (req, res) => {
+app.post('/compress', requireAuth, upload.single('video'), prepareVideo, async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded. Use form-data field "video".' });
   }
@@ -677,6 +733,9 @@ setInterval(sweepFiles, 10 * 60 * 1000).unref();
 
 // Basic error handler
 app.use((err, req, res, next) => {
+  if (err.status && err.code) {
+    return res.status(err.status).json({ error: err.message, code: err.code });
+  }
   if (err instanceof multer.MulterError) {
     const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
     return res.status(status).json({ error: err.message, code: err.code });
@@ -685,7 +744,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-const server = app.listen(port, '0.0.0.0', () => {
+export const server = app.listen(port, '0.0.0.0', () => {
   console.log(`audio-extract-api listening on 0.0.0.0:${port} (files: ${filesDir}, tmp: ${os.tmpdir()})`);
 });
 

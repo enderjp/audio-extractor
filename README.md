@@ -44,9 +44,9 @@ llegan más videos de los que el servidor puede procesar.
 ### POST /extract
 - Descripción: recibe un archivo de video y devuelve el audio en MP3
 - Auth: requerida (Bearer token)
-- Content-Type: multipart/form-data
+- Content-Type: `multipart/form-data` o `application/json` con `{ "url": "https://..." }`
 - Campo de archivo: `video`
-- Tamaño máximo: 1 GB (ajustable en server.js → multer.limits.fileSize)
+- Tamaño máximo: 1 GiB (`MAX_INPUT_MB=1024`)
 - Respuesta 200: `audio/mpeg` (archivo adjunto .mp3)
 - Parámetros de salida:
   - Codec: libmp3lame
@@ -65,11 +65,11 @@ curl -s \
 ### POST /compress
 - Descripción: recibe un video, lo comprime hasta quedar bajo un peso objetivo y devuelve la URL de descarga
 - Auth: requerida (Bearer token)
-- Content-Type: multipart/form-data
+- Content-Type: `multipart/form-data` o `application/json` con `{ "url": "https://..." }`
 - Campo de archivo: `video`
 - Tamaño máximo de entrada: 1 GB
 
-Parámetros opcionales (form-data o query string):
+Parámetros opcionales (JSON, form-data o query string; el body tiene prioridad):
 
 | Parámetro | Default | Rango | Descripción |
 |---|---|---|---|
@@ -117,7 +117,56 @@ curl -s \
   "https://<TU_HOST>.ts.net/compress?max_mb=74"
 ```
 
-Uso en n8n:
+### Entrada por URL en `/compress` y `/extract`
+
+Para evitar descargar el video original en n8n, enviar la URL firmada directamente:
+
+```bash
+curl -s \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://<URL_FIRMADA_DE_MONDAY>"}' \
+  "https://audio.extractor.api.137-184-149-94.sslip.io/compress?max_mb=74"
+```
+
+El mismo JSON funciona con `/extract`, que sigue devolviendo el archivo MP3.
+`/compress` conserva el JSON anterior, incluidos `filename` y `video_url`, y
+`DELETE /files/{filename}` sigue funcionando. `original_filename` se obtiene del
+path de la URL final; no incluye la firma ni el query string. Multipart sigue disponible.
+
+La descarga se inicia al admitir el request, **antes** de esperar turno de ffmpeg.
+Se escribe en disco con streaming, con un máximo de `MAX_INPUT_MB` (1024 MiB por
+defecto), verificado tanto por Content-Length como por bytes recibidos. El timeout
+total de descarga es `DOWNLOAD_TIMEOUT_MS` (300000 ms por defecto), incluidos DNS
+y hasta 3 redirecciones. No se hace una petición HEAD previa ni se reintenta un
+enlace vencido. Los archivos parciales se eliminan al fallar o cancelar.
+
+Solo se permiten URLs HTTP(S) públicas sin credenciales embebidas; cada destino y
+redirección se valida contra redes internas, loopback y direcciones reservadas.
+La IP validada se fija para la conexión, manteniendo el hostname para TLS.
+La URL debe permitir descargar sin headers adicionales de autenticación.
+
+Se admiten hasta `MAX_CONCURRENT_JOBS + MAX_QUEUED_JOBS` requests por URL en curso
+(5 por defecto), contando descarga, espera y procesamiento. Al alcanzar ese límite
+se responde `429` con `Retry-After: 60` sin iniciar otra descarga. La cola de ffmpeg
+también puede responder `429` si está ocupada por cargas multipart.
+
+Uso recomendado en n8n:
+1. Quitar el nodo que descarga el MP4 original.
+2. En **HTTP Request**, usar POST a `/compress?max_mb=74`, conservar el Bearer token,
+   elegir **JSON** y enviar `url` con el valor de `public_url` recibido de Monday.
+   Usar el editor de expresiones para construir el objeto y conservar la URL completa.
+3. Usar `video_url` y `filename` del JSON como antes; mantener el DELETE al final.
+4. Configurar el timeout del nodo para cubrir descarga, cola y compresión. Ante un
+   `429`, esperar el `Retry-After` antes de reintentar; si el link venció, obtener una
+   URL nueva de Monday. Esto sigue siendo una operación sincrónica.
+
+Errores de entrada por URL: `400` URL inválida o destino no permitido, `408`
+timeout de descarga, `413` límite excedido, `422` fallo de red, HTTP remoto distinto
+de 200 (por ejemplo 403 por firma vencida), archivo vacío o demasiadas redirecciones.
+Los errores incluyen `error` y `code`, sin exponer el query firmado.
+
+Uso multipart en n8n (compatible con el flujo anterior):
 1. Nodo **HTTP Request** → `POST https://<TU_HOST>.ts.net/compress`,
    Authentication: Header `Authorization: Bearer <TOKEN>`,
    Body: Form-Data, campo `video` de tipo *n8n Binary File* (propiedad `data`).
@@ -337,6 +386,9 @@ Tailscale Serve/Funnel sirve sin cambios.
 ```bash
 cd /srv/api-audio-extractor/audio-extractor
 git pull
+# El Dockerfile del servidor no está versionado: incluir el nuevo módulo de descarga.
+# Si contiene COPY . ., ya lo incluye; con la plantilla anterior, aplicar:
+sed -i 's/^COPY server\.js \.\/$/COPY server.js video-input.js .\//' Dockerfile
 docker compose up -d --build   # --build es necesario si cambiaron las dependencias
 curl -s http://127.0.0.1:3080/health
 ```
@@ -411,6 +463,8 @@ Logs: `journalctl -u audio-extract-api -f`
 - 400: No se envió archivo (`video`) o request inválido
 - 401: Falta o es inválido el Bearer token
 - 413: Archivo supera el límite (1 GB por defecto)
+- 408: Timeout descargando el video por URL
+- 422: No se pudo descargar el video por URL (HTTP remoto, red, vacío o redirecciones)
 - 429: Cola de encodes llena (`Retry-After: 60`); reintentar más tarde
 - 500: Error interno de ffmpeg o del servidor
 
@@ -419,7 +473,8 @@ El servidor intenta limpiar archivos temporales luego de enviar la respuesta.
 ---
 
 ## Configuración y límites
-- Límite de archivo: `multer.limits.fileSize` en `server.js` (por defecto 1 GB)
+- `MAX_INPUT_MB`: límite de entrada multipart y por URL (default 1024 MiB)
+- `DOWNLOAD_TIMEOUT_MS`: timeout total de descarga por URL (default 300000 ms)
 - Variables de entorno (ver `.env.example`; en Docker, las de rutas las fija `docker-compose.yml`):
   - `FILES_DIR`: carpeta de salida servida en `/files` (default `./files`)
   - `FILE_TTL_MINUTES`: vigencia de cada archivo (default 180). Hay un barrido cada 10 min
