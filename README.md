@@ -288,14 +288,34 @@ En `/health`, `aborted` cuenta cuántas veces pasó. Si ese número sube, el tim
 nodo en n8n es más corto que lo que tarda un encode: conviene subirlo (ver más abajo)
 en vez de dejar que reintente.
 
+### Límites de recursos en producción
+
+Configurados en el Docker Compose del droplet el 2026-11-11:
+
+```yaml
+cpus: 1.5
+mem_limit: 1536m
+memswap_limit: 2g
+```
+
+El contenedor puede usar hasta 1,5 vCPU, 1,5 GiB de RAM y 512 MiB adicionales
+de swap (`memswap_limit` representa RAM + swap). Se aplican a todo el contenedor:
+Node, descargas y ffmpeg. La cola de producción mantiene 1 encode y hasta 6
+solicitudes adicionales por URL descargando o esperando.
+
+Los límites se aplicaron en vivo con `docker update`, sin reinicio, y se guardaron
+en el Compose del servidor para conservarlos al recrear el contenedor. Un video
+que exceda el presupuesto de memoria puede fallar; la cola no garantiza un máximo
+de RAM por video. Al reducir CPU, una compresión puede tardar más.
+
 ### Si aun así se satura
 
 - **Subí el timeout del nodo HTTP en n8n** a 900000 ms (15 min) y **desactivá el
   reintento automático**: con la cola, esperar es el comportamiento correcto.
 - **Bajá el costo por video**: `preset=veryfast`, `fps=10`, o `max_height=480` cuando
   la calidad no importe. El preset es lo que más mueve la aguja.
-- **Limitá el contenedor** para que ffmpeg no ahogue a los demás servicios del droplet.
-  En el compose: `cpus: 1.5` y `mem_limit: 2g`.
+- **Revisá los límites del contenedor** descritos arriba antes de aumentar la
+  concurrencia; el droplet comparte recursos con otros servicios.
 - **Serializá en n8n**: si el flujo procesa varios videos, mandalos de a uno (Split in
   Batches con tamaño 1) en vez de en paralelo.
 
